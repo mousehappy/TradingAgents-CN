@@ -1612,8 +1612,12 @@ class DataSourceManager:
 
                 # 根据数据源类型获取股票信息
                 if source == ChinaDataSource.TUSHARE:
-                    # 🔥 直接调用 Tushare 适配器，避免循环调用
-                    result = self._get_tushare_stock_info(symbol)
+                    # 🔥 检查是否实现了 Tushare 方法，否则跳过
+                    if hasattr(self, '_get_tushare_stock_info'):
+                        result = self._get_tushare_stock_info(symbol)
+                    else:
+                        logger.warning(f"⚠️ [股票信息] Tushare 方法未实现，跳过")
+                        continue
                 elif source == ChinaDataSource.AKSHARE:
                     result = self._get_akshare_stock_info(symbol)
                 elif source == ChinaDataSource.BAOSTOCK:
@@ -1646,6 +1650,98 @@ class DataSourceManager:
         logger.error(f"❌ 所有数据源都无法获取{symbol}的股票信息")
         return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'unknown'}
 
+    def _get_tushare_stock_info(self, symbol: str) -> Dict:
+        """使用 Tushare 获取股票基本信息
+
+        🔥 Tushare 需要使用 ts_code 格式（如 688758.SH 或 000001.SZ）
+
+        Args:
+            symbol: 股票代码（6 位数字）
+
+        Returns:
+            Dict: 标准化股票信息，包含 symbol, name, area, industry, market, list_date, source
+        """
+        try:
+            import tushare as ts
+            from tradingagents.config.tushare_config import get_tushare_config
+            from tradingagents.config.runtime_settings import use_app_cache_enabled
+
+            # 🔥 获取 Tushare 配置
+            config = get_tushare_config()
+
+            # 🔥 降级逻辑：即使 TUSHARE_ENABLED=false，如果有 Token 也尝试使用
+            # 因为在 _try_fallback_stock_info 中调用此方法时，已经是降级场景
+            has_token = config.token and len(config.token) >= 30
+            use_cache = use_app_cache_enabled()
+
+            if not has_token:
+                logger.warning(f"⚠️ [股票信息] Tushare Token 未配置，跳过")
+                return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'tushare', 'error': 'No token'}
+
+            # 🔥 初始化 Tushare API
+            ts.set_token(config.token)
+            api = ts.pro_api()
+
+            # 🔥 转换为 Tushare 格式的股票代码
+            # Tushare 需要 ts_code 格式：688758.SH（上海）或 000001.SZ（深圳）
+            if symbol.startswith('6') or symbol.startswith('9'):
+                # 上海股票：688758 -> 688758.SH
+                ts_code = f"{symbol}.SH"
+            elif symbol.startswith(('0', '3', '2')):
+                # 深圳股票：000001 -> 000001.SZ
+                ts_code = f"{symbol}.SZ"
+            elif symbol.startswith(('8', '4')):
+                # 北京股票：830000 -> 830000.BJ
+                ts_code = f"{symbol}.BJ"
+            else:
+                # 其他情况，尝试使用原始代码
+                ts_code = symbol
+
+            logger.debug(f"📊 [Tushare 股票信息] 原始代码：{symbol}, Tushare 格式：{ts_code}")
+
+            # 查询股票基本信息
+            # 使用 stock_basic 接口获取基础信息
+            df = api.stock_basic(
+                ts_code=ts_code,
+                fields='ts_code,symbol,name,area,industry,market,exchange,list_date,is_hs,act_name,act_ent_type'
+            )
+
+            if df is not None and not df.empty:
+                row = df.iloc[0].to_dict()
+
+                # 标准化返回格式（与 _get_akshare_stock_info 保持一致）
+                info = {
+                    'symbol': symbol,
+                    'name': row.get('name', f'股票{symbol}'),
+                    'area': row.get('area', '未知'),
+                    'industry': row.get('industry', '未知'),
+                    'market': row.get('market', '未知'),
+                    'list_date': row.get('list_date', '未知'),
+                    'source': 'tushare',
+                    # 额外信息（用于下游兼容性）
+                    'ts_code': ts_code,
+                    'exchange': row.get('exchange', ''),
+                    'is_hs': row.get('is_hs', ''),
+                    'act_name': row.get('act_name', ''),  # 实控人名称
+                    'act_ent_type': row.get('act_ent_type', ''),  # 实控人企业类型
+                }
+
+                logger.info(f"✅ [Tushare 股票信息] {symbol} -> {info['name']} ({info['market']})")
+                return info
+            else:
+                logger.warning(f"⚠️ [Tushare 股票信息] 返回空数据：{symbol}")
+                return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'tushare'}
+
+        except Exception as e:
+            error_msg = str(e)
+            # 检查是否为限流错误
+            if '超过限流次数' in error_msg or '流量超限' in error_msg or 'rate limit' in error_msg.lower():
+                logger.warning(f"⚠️ [Tushare 股票信息] 触发限流：{symbol}")
+            else:
+                logger.error(f"❌ [股票信息] Tushare 获取失败：{symbol}, 错误：{e}")
+
+            return {'symbol': symbol, 'name': f'股票{symbol}', 'source': 'tushare', 'error': error_msg}
+
     def _get_akshare_stock_info(self, symbol: str) -> Dict:
         """使用AKShare获取股票基本信息
 
@@ -1674,7 +1770,7 @@ class DataSourceManager:
             logger.debug(f"📊 [AKShare股票信息] 原始代码: {symbol}, AKShare格式: {akshare_symbol}")
 
             # 尝试获取个股信息
-            stock_info = ak.stock_individual_info_em(symbol=akshare_symbol)
+            stock_info = ak.stock_individual_info_em(symbol=symbol)
 
             if stock_info is not None and not stock_info.empty:
                 # 转换为字典格式

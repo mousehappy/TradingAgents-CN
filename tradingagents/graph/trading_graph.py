@@ -1053,6 +1053,14 @@ class TradingAgentsGraph:
         decision = self.process_signal(final_state["final_trade_decision"], company_name)
         decision['model_info'] = model_info
 
+        # 导出分析结果到文件
+        try:
+            from tradingagents.utils.analysis_result_exporter import export_analysis_result
+            filepath = export_analysis_result(ticker, trade_date, final_state, decision)
+            logger.info(f"📁 [TradingGraph] 分析结果已导出到：{filepath}")
+        except Exception as export_error:
+            logger.error(f"❌ [TradingGraph] 导出分析结果失败：{export_error}")
+
         # Return decision and processed signal
         return final_state, decision
 
